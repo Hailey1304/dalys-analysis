@@ -1,0 +1,781 @@
+---
+title: "Outline Analysis STAT 209"
+author: "Nam Nguyen & Hailey Nguyen"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document: default
+spacing: double
+knit: (function(inputFile, encoding) { 
+      out_dir <- 'pdf';
+      out_file <- sub(".Rmd", ".pdf", basename(normalizePath(inputFile)));
+      rmarkdown::render(inputFile,encoding=encoding, 
+                        output_file = file.path(dirname(inputFile), out_dir, out_file))})
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+if (getwd() != "~/STAT209/Final") {
+  setwd("~/STAT209/Final")
+}
+```
+
+# 1.Import Necessities
+
+## 1.1 Import Library
+```{r library}
+library(tidyverse)
+library(maps)
+library(janitor)
+library(expss)
+library(zoo)
+library(kableExtra)
+library(patchwork)
+
+library(tidymodels)
+```
+
+## 1.2 Import Data
+```{r data, cache=TRUE}
+dataDir <- "~/STAT209/Final/Data"
+
+lifeExpectancyDir <- paste(dataDir, "lifeExpectancy.csv", sep = "/")
+mentalDisorderDir <- paste(dataDir, "mentalDisorder.csv", sep = "/")
+sustainableEnergyDir <- paste(dataDir, "sustainableEnergy.csv", sep = "/")
+
+lifeExpectancyRaw <- read_csv(lifeExpectancyDir)
+mentalDisorderRaw <- read_csv(mentalDisorderDir)
+sustainableEnergyRaw <- read_csv(sustainableEnergyDir)
+```
+
+# 2.Data Cleaning & Merging
+
+## 2.1 Rename & Merge Data
+To merge our data, we will use Country Name and Country Code to map one-on-one between the datasets. There are similar variable called CO2 between **Life Expectancy Data** and **Sustainable Energy Data**, therefore we intended to only keep one variable from the **Life Expectancy Data** and drop the other one. We decide not to merge one-to-one between them due to minor floating precision, which might lead to significant drop of observations.
+
+```{r clean, cache=TRUE}
+lifeExpectancy <- lifeExpectancyRaw |> 
+  rename(Code = "Country Code", Entity = "Country Name") |>
+  rename_with(
+    function(x) 
+      gsub("\\s|%", "", str_to_title(x))) |>
+  rename(LifeExpectancy = LifeExpectancyWorldBank,
+         Undernorish = PrevelanceOfUndernourishment,
+         IncomeGroup = Incomegroup,
+         HealthExp = HealthExpenditure,
+         EducExp = EducationExpenditure,
+         DalyInjure = Injuries,
+         DalyComm = Communicable,
+         DalyNoncomm = Noncommunicable)
+
+mentalDisorder <- mentalDisorderRaw |>
+  rename_with(
+    function(x) 
+      gsub("\\s+", "", 
+           str_to_title(
+             gsub(".*\\-\\s(.*)\\-\\sSex.*", "\\1", x))),
+    starts_with("Prevalence")) |>
+  rename_with(
+    function(x)
+      gsub("Disorder.*$", "", x))
+
+
+sustainableEnergy <- sustainableEnergyRaw |>
+  rename(CO2 = Value_co2_emissions_kt_by_country) |>
+  rename_with(
+    function(x)
+      str_to_title(gsub("(.*?)\\(.*\\)", "\\1", x)),
+    ends_with(")")) |>
+  rename_with(
+      function(x)
+        gsub("\\s", "", str_to_title(gsub("\\-|_", " ", x)))) |> 
+  rename(ElecAcc = AccessToElectricity,
+         CookFuelAcc = AccessToCleanFuelsForCooking,
+         ReElecGen = RenewableElectricityGeneratingCapacityPerCapita,
+         FinFlow = FinancialFlowsToDevelopingCountries,
+         ReEnergyPct = RenewableEnergyShareInTheTotalFinalEnergyConsumption,
+         ElecFossilFuels = ElectricityFromFossilFuels,
+         ElecNuclear = ElectricityFromNuclear,
+         ElecRenewables = ElectricityFromRenewables,
+         LowCarbon = LowCarbonElectricity,
+         PersonConsume = PrimaryEnergyConsumptionPerCapita,
+         EconomyConsume = EnergyIntensityLevelOfPrimaryEnergy) |>
+  select(-c(Co2))
+  
+country_data <- mentalDisorder |>
+  inner_join(lifeExpectancy, by=c("Entity", "Code", "Year")) |>
+  inner_join(sustainableEnergy, by=c("Entity", "Year"))
+
+
+glimpse(country_data) 
+```
+
+\pagebreak
+## 2.2 Data Cleaning and Selection
+
+### 2.2.1 Data Accessing
+```{r missingCheck, cache=TRUE}
+country_data |> is.na() |> colSums()
+```
+From the summary, we loss many data points from columns *Corruption*, *Sanitation*, *FinFlow*, *ReElecGen*, *Renewables*. We decide to substitute *ReElecGen* and *FinFlow* missing data with 0 to indicate they don't have any of the resources. For *FinFlow* variable, we rename it to *FDIclean* as it is the foreign direct investment for clean energy and create a new variable called *Invested* with boolean value if *FDIclean* is greater than zero. We also create a variable called *RenewGen* to indicate if the country have renewable energy generator or not. We will drop *Corruption*, *Sanitation*, *Renewables* as they have too much missing data. To replace all other missing value, we want to use **interpolate** technique within country to substitute due to the time series nature of the dataset across each country. Lastly, we will drop all remain missing values if they have missing data from the start or the end of year's time in the data set.
+
+In addition to those variable, we want to create new response variable for DALYs in percentage. Currently, we have 3 categories of DALYs: Injuries, Comunnicable Diseases, and Non Communicable Diseases. Hence, we will create other variable be as shares of DALYs due to (Non) Communicable Disease to scale these variables.
+
+\pagebreak
+### 2.2.2 Data Cleaning
+```{r missingChange, cache=TRUE}
+country_tidy <- country_data |> group_by(Code) |>
+  mutate(ReElecGen = na.approx(ReElecGen, na.rm = F),
+         EducExp = na.approx(EducExp, na.rm = F),
+         Unemployment = na.approx(Unemployment, na.rm = F),
+         Undernorish = na.approx(Undernorish, na.rm = F),
+         FDIClean = replace_na(FinFlow, 0),
+         Invested = as.factor(ifelse(is.na(FinFlow), "No", "Yes")),
+         RenewGen = as.factor(ifelse(is.na(ReElecGen), "No", "Yes")),
+         ReElecGen = replace_na(ReElecGen, 0),
+         ElecNuclear = replace_na(ElecNuclear, 0),
+         IncomeGroup = factor(gsub(" income", "", IncomeGroup)),
+         DalyCommPct = 
+           DalyComm*100/(DalyComm + DalyNoncomm + DalyInjure),
+         DalyNoncommPct = 
+           DalyNoncomm*100/(DalyComm + DalyNoncomm + DalyInjure)) |>
+  select(-c(Corruption, Sanitation, Renewables, FinFlow)) |>
+  drop_na(GdpGrowth, GdpPerCapita, EducExp, 
+          Unemployment, Undernorish, CookFuelAcc,
+          ReEnergyPct, HealthExp)
+
+country_tidy |> count() |> filter(n <= 9)
+```
+We can see that there are some countries that has less than 9 observations, which could affect our dataset quality. Hence, we decide to drop all of them. There is only 11 countries recorded in North America, hence, these might cause an imbalance in the dataset, we will also drop them out
+
+### 2.2.3 Data Selection
+```{r countryDrop, cache=TRUE}
+keep_country <- country_tidy |> count() |> filter(n > 9) |> select(Code) |> pull()
+
+country_tidy <- country_tidy |> ungroup() |>
+  filter(Code %in% keep_country & Region != "North America") |>
+  mutate(
+    Invested = relevel(Invested, "No"),
+    RenewGen = relevel(RenewGen, "No"))
+
+glimpse(country_tidy)
+```
+
+After all cleaning, our data has 37 variables and 1944 observations at country level.
+
+## 2.3 Data Labeling
+```{r dataLabel, cache=TRUE}
+country_tidy <- country_tidy |> apply_labels(
+  Entity = "Country Name",
+  Code = "Country Short",
+  Year = "Year", 
+  Region = "Continient Location",
+  IncomeGroup = "Income Group",
+  Latitude = "Latitude of the Country",
+  Longitude = "Longitude of the Country",
+  Density = "Population density per square kilometer (Pop/Km2)",
+  LandArea = "Total land area in square kilometers (Km2)",
+  GdpGrowth = "Annual GDP growth rate based on local currency (%)",
+  GdpPerCapita = "Gross domestic product per person (GDP/capita)",
+  
+  Schizophrenia = "Schizophrenia Disorder(% Pop)",
+  Bipolar = "Bipolar Disorder(% Pop)",
+  Eating = "Eating Disorder(% Pop)",
+  Anxiety = "Anxiety Disorder(% Pop)",
+  DrugUse = "Substance Use Disorder(% Pop)", 
+  Depressive = "Depressive Disorder(% Pop)",
+  AlcoholUse = "Alcohol Use Disorder(% Pop)",
+  ElecAcc = "Access to Electricity(% Pop)",
+  CookFuelAcc = "Access to Clean Cooking Fuel(% Pop)",
+  Undernorish = "Undernorished(% Pop)",
+  
+  HealthExp = "Health expenditure (% of GDP)",
+  EducExp = "Education expenditure (% of GDP)",
+  Unemployment = "Labor force that is without work  (% labor force)",
+  
+  LifeExpectancy = "Life Expectancy (Year)",
+  DalyInjure = "DALYs due to Injuries (Year)",
+  DalyComm = "DALYs due to Communicable diseases (Year)",
+  DalyNoncomm = "DALYs due to Non-Communicable diseases (Year)",
+  DalyCommPct = "Percentage of DALYs due to Communicable diseases (%)",
+  DalyNoncommPct = "Percentage of DALYs due to Non-Communicable diseases (%)",
+ 
+  Co2 = "Carbon dioxide emissions (kiloton)",
+  ReElecGen = "Generating capacity of Renewable electricity (W/capita)",
+  
+  ElecFossilFuels = "Fossil Fuels Electricity (TWh)",
+  ElecNuclear = "Nuclear Electricity (TWh)",
+  ElecRenewables = "Renewable Electricity (TWh)",
+  
+  ReEnergyPct = "Renewable Energy in total energy consumption (% Energy)",
+  LowCarbon = "Electricity from low-carbon sources (% Energy)",
+  RenewGen = "Has Renewable electricity generator",
+  
+  PersonConsume =  "Energy consumption per person (kWh/person)",
+  EconomyConsume = "Energy use per unit of GDP at purchase power parity (PPP GDP)",
+  
+  Invested = "Has FDI for clean energy",
+  FDIClean = "FDI for clean energy (USD)")
+
+write_labelled_csv(country_tidy, "./Data/countryClean.csv")
+```
+
+## 2.4 Research Question & Summary Statistic
+
+### 2.4.1 Research Question
+
+We want to define our research question here before we go into analysis. Here are the following interest question:
+\begin{enumerate}
+  \item How does socio-ecomonic factors and mental illness contributes to DALYs due to non-communicable diseases?
+  \item How does socio-ecomonic factors and energy pollutions contributes to DALYs due to communicable diseases?
+  \item Does socio-ecomonic factors differs the effects of mental illness on DALYs due to non-communicable diseases?
+  \item Does socio-ecomonic factors differs the effects of energy factos on DALYs due to communicable diseases?
+  \item Is there a relationship between mental illess and energy factors between countries with same socio-economic levels?
+\end{enumerate}
+
+### 2.4.2 Continuous And Categorical Variable
+```{r statContTable, results = "asis"}
+options(knitr.kable.NA = '-')
+
+cont_table <- country_tidy |>
+  tab_cells(Schizophrenia, Bipolar, Eating, Anxiety,
+            DrugUse, Depressive, AlcoholUse, 
+            Density, LandArea, GdpGrowth, GdpPerCapita,
+            Undernorish, HealthExp, EducExp, Unemployment,
+            ElecAcc, CookFuelAcc, LifeExpectancy,
+            DalyInjure, DalyComm, DalyCommPct, 
+            DalyNoncommPct, DalyNoncomm,
+            Co2, ReElecGen,
+            ElecFossilFuels, ElecNuclear, ElecRenewables,
+            ReEnergyPct, LowCarbon,
+            PersonConsume, EconomyConsume, FDIClean) |>
+  tab_stat_fun(
+    "Median" = w_median, "Mean" = w_mean,
+    "Std. dev." = w_sd, "Valid N" = w_n, method = list) |>
+  tab_pivot() |>
+  expss::split_table_to_df() 
+
+cate_count <- rbind(
+  country_tidy |> count(Region) |> rename(var = Region),
+  country_tidy |> count(IncomeGroup) |> rename(var = IncomeGroup),
+  country_tidy |> count(Invested) |> rename(var = Invested),
+  country_tidy |> count(RenewGen) |> rename(var = RenewGen)) |>
+  mutate(Mean = NA, Median = NA, SD = NA) |>
+  select(var, Mean, Median, SD, n)
+
+cont_table <- cont_table[-c(1, 2),]
+rownames(cont_table) <- NULL
+colnames(cont_table) <- c("Variable", "Median", 
+                          "Mean", "Std. Dev.", "Count")
+
+colnames(cate_count) <- c("Variable", "Median", 
+                   "Mean", "Std. Dev.", "Count")
+
+rbind(cont_table, cate_count) |>
+  mutate(
+    Mean = as.numeric(Mean),
+    `Std. Dev.` = as.numeric(`Std. Dev.`),
+    Count = as.numeric(Count),
+    Median = as.numeric(Median)) |>
+  kable(digits = 3, align = "lcccc", 
+        format.args = list(big.mark = ","), 
+        format = "latex", linesep = "",
+        caption = "Summary Statistic Table") |> 
+  group_rows("Mental Illness (Continuous)", 1, 7) |>
+  group_rows("Country Info (Continuous)", 8, 23) |>
+  group_rows("Energy (Continuous)", 24, 33) |>
+  group_rows("Country Info (Categorical)", 34, 43) |>
+  group_rows(var_lab(country_tidy$Region), 34, 39,
+             bold = F, label_row_css = "") |>
+  group_rows(var_lab(country_tidy$IncomeGroup), 40, 43,
+             bold = F, label_row_css = "") |>
+  group_rows("Energy (Categorical)", 44, 47) |>
+  group_rows(var_lab(country_tidy$Invested), 44, 45,
+             bold = F, label_row_css = "") |>
+  group_rows(var_lab(country_tidy$RenewGen), 46, 47,
+             bold = F, label_row_css = "") |>
+  add_header_above(c(" " = 1,
+                     "Statistical Summary" = 4), 
+                     align = "c") |>
+  kable_styling(full_width = F, font_size = 8)
+```
+
+There are a few variables that there is a major skewed in the data such as *Density, Land Area, DALYS due to Injuries/Communicable/Non-Communicable Diseases*, which can be caused by individual population relatively to that country, hence, we might want to find a way to scale all our variable accordingly. We decide to scale all the skewed variable with **natural log** function. 
+
+### 2.4.3 Categorical Variables CrossTab
+
+We process with a crosstab table to look at the frequency between categorical variable.
+
+```{r crossTabCategorical, results = "asis", cache=TRUE}
+cate_table <- country_tidy |>
+  tab_cells(IncomeGroup, Region) |>
+  tab_cols(Invested, RenewGen) |>
+  tab_stat_cases(total_statistic = "u_cases", 
+                 total_label = "Total") |>
+  tab_pivot() |>
+  split_table_to_df() 
+
+cate_table <- cate_table[-c(1, 2),]
+cate_table[, c(3, 4, 5, 6)] <- lapply(cate_table[, c(3, 4, 5, 6)], as.numeric)
+
+rownames(cate_table) <- NULL
+colnames(cate_table) <- c("Continent Info", "Category", 
+                          "InvestedNo", "InvestedYes", 
+                          "RenewGenNo", "RenewGenYes")
+
+cate_table |>
+  adorn_totals(where = "col", select = c("InvestedNo", "InvestedYes")) |>
+  kable(col.names = c("Continent Info", "Category", 
+                      "No", "Yes", "No", "Yes", "#Total"),
+    digits = 3, align = "llccccc", 
+    format.args = list(big.mark = ","), booktabs = TRUE, 
+    format = "latex", linesep = "",
+    caption = "Crosstab Table between Country Info vs. Energy") |>
+  column_spec(2, border_right = T) |>
+  add_header_above(c(" " = 1, "Energy" = 1,
+                     "Has FDI for \n clean energy" = 2, 
+                     "Has Renewable \n electricity generator" = 2,
+                     " " = 1), 
+                     align = "c") |>
+  kable_styling(full_width = F)
+```
+
+We can see that there is an imbalance between level of categorical data, we want to use all categorical data in the model as explanatory variable to identify any fixed effect as well as any mixed between regions and income group. Hence, we might want to test them out with a Lasso model to identify the significant categorical variable on both DALY communicated and non-communicated diseases.
+
+# 3. Preliminary Visualization
+
+## 3.1 DALYs Across Countries
+
+We can see that there is a clear distinction of DALYs between countries, we think that DALYs correlated with population as India and China are 2 countries with higher DALYs than others. Due to the gap between DALYs of countries, we will use the *DalyCommPct* and *DalyNoncommPct* to measure our variable instead of actual DALYs measurement.
+
+```{r worldPreliminary, fig.height=18, fig.width = 15, cache=TRUE}
+world_map <- map_data("world") |> 
+  rename("Entity" = "region") |> apply_labels(Entity = "Country Name")
+
+world_vis <- country_tidy |> filter(Year == 2013) |>
+  select(Entity, DalyCommPct, DalyNoncommPct) |>
+  right_join(world_map, by = "Entity") 
+
+ (ggplot(world_vis) +
+   geom_map(aes(map_id = Entity, fill = DalyCommPct, 
+                alpha = is.na(DalyNoncommPct),
+                color = is.na(DalyNoncommPct)),
+            map = map_data("world"), show.legend = F) + 
+   scale_alpha_manual(values = c("TRUE" = 0.5, "FALSE" = 1), guide = FALSE) + 
+   scale_color_manual(values = c("TRUE" = 0, "FALSE" = 1), guide = FALSE) +
+   scale_fill_continuous(limits = c(0, 100), low = "lightblue", high = "darkblue") +
+   expand_limits(x = world_vis$long, y = world_vis$lat) +
+   theme(
+      axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+      axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+      title = element_text(size = 18)) +
+   labs(y = var_lab(country_tidy$DalyCommPct), x = "",
+        title = "World Visualization for DALYs Percentages")) /
+ (ggplot(world_vis) +
+   geom_map(aes(map_id = Entity, fill = DalyNoncommPct, 
+                alpha = is.na(DalyCommPct),
+                color = is.na(DalyCommPct)),
+            map = map_data("world")) + 
+   scale_alpha_manual(values = c("TRUE" = 0.5, "FALSE" = 1), guide = FALSE) + 
+   scale_color_manual(values = c("TRUE" = 0, "FALSE" = 1), guide = FALSE) +
+   scale_fill_continuous(limits = c(0, 100), low = "lightblue", high = "darkblue") +
+   theme(
+      axis.text.y = element_blank(), axis.ticks.y = element_blank(),
+      axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+      title = element_text(size = 18), legend.position = "bottom") +
+   labs(y = var_lab(country_tidy$DalyNoncommPct), x = "",
+        fill = "DALYs due to (Non) \nCommunicable Diseases") + 
+   expand_limits(x = world_vis$long, y = world_vis$lat) +
+  guides(fill = guide_colorbar(barwidth = 40, barheight = 1)))
+```
+
+We can see that countries in Africa has more shares of DALYs causes by Communicable Disease, while the rest of the countries has more shares of Non-communicable diseases. We suspect that these could happen due to some socio-economic variables such as *Health/Education services* or simply *Life Expectancy*
+
+## 3.2 Correlation Table
+
+We want to examine the correlation between continuous variables, we will focus on correlations between DALYs variables and explanatory variables such as mental health and socio-economics.
+
+```{r correlationTable, fig.height=10, fig.width=10, cache=TRUE}
+corTable <- country_tidy[,-c(1)] |>
+  select(-c(Code, Region, IncomeGroup, Latitude, Longitude, Invested, RenewGen)) |> 
+  cor()
+corTable[lower.tri(corTable)] <- NA
+
+corTable |> reshape2::melt(na.rm = T) |>
+  ggplot(aes(x = Var1, y = Var2, fill = value)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                         midpoint = 0, limit = c(-1,1), space = "Lab", 
+                         name="Pearson\nCorrelation") +
+    theme(
+      axis.text.x = element_text(angle = 90, vjust = 1, size = 10, hjust = 1),
+      axis.text.y = element_text(angle = 0, vjust = 1, size = 10, hjust = 1),
+      axis.title.x = element_blank(), axis.title.y = element_blank()) + 
+  labs(title = "Correlation between continuous variables") +
+  coord_fixed()
+```
+
+The first 2 rows indicate the correlation between shares of different DALYs and other explanatory variables. We can see that all Mental Health variable related are negatively correlated with Communicable disease percentage, while some Mental Health variables such as (*Schizophrenia, Bipolar, Eating, Anxiety*) positively correlated with Non Communicable Disease DALYs. We see that *Electric and Clean Cooking Fuel Access* also contribute positively to Non Communicable DALYs. However, it is surprising that the *Renewable Energy Shares* of a country is correlated positively with Communicable Diseases Shares.
+
+Other correlation that worth notices are between *CO2 emission* and electricity related such as *ElecFossilFuel*, *ElecNuclear*. *Undernorish* is negatively correlated with Mental Health variables and *Life Expectancy*. An interesting factor is that *Life Expectancy* is actually positively correlated with Mental Health variables and *DalyNoncommPct*.
+
+## 3.3 Preliminary DALYs vs. Categorical Variable
+
+We want to see the distribution of DALYs between categorical variables. For this, we will use the boxplot to visualise our distributions.
+
+```{r DalyVsCategorical, fig.height = 10, fig.width = 15, cache=TRUE}
+# Top Left: Communicable DALYs vs. Invested with IncomeGroup
+(country_tidy |>
+  ggplot(aes(y = DalyCommPct, x = Invested, fill = IncomeGroup)) +
+    geom_boxplot() +
+    theme(legend.position = "top") +
+    guides(fill = guide_legend(nrow = 1)) +
+    scale_y_continuous(limits = c(0, 100)) +
+    theme(axis.title.x = element_blank(),
+          axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          legend.text = element_text(size = 15),
+          legend.title = element_text(size = 12)) +
+    labs(y = var_lab(country_tidy$DalyCommPct), 
+         fill = var_lab(country_tidy$IncomeGroup)) +
+# Top Right: Communicable DALYs vs. RenewGen with IncomeGroup
+country_tidy |>
+  ggplot(aes(y = DalyCommPct, x = RenewGen, fill = IncomeGroup)) +
+  geom_boxplot(show.legend = F) +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  scale_y_continuous(limits = c(0, 100))) /
+# Bottom Left: Non Communicable DALYs vs. Invested with IncomeGroup
+(country_tidy |>
+  ggplot(aes(y = DalyNoncommPct, x = Invested, fill = IncomeGroup)) +
+    geom_boxplot(show.legend = F) +
+    theme(legend.position = "top") +
+    guides(fill = guide_legend(nrow = 1)) +
+    scale_y_continuous(limits = c(0, 100)) +
+    labs(y = var_lab(country_tidy$DalyNoncommPct), 
+         x = var_lab(country_tidy$Invested),
+         fill = var_lab(country_tidy$IncomeGroup)) +
+# Bottom Right: Non Communicable DALYs vs. RenewGen with IncomeGroup
+country_tidy |>
+  ggplot(aes(y = DalyNoncommPct, x = RenewGen, fill = IncomeGroup)) +
+  geom_boxplot(show.legend = F) +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = var_lab(country_tidy$RenewGen)))
+```
+
+We think that there is a difference between the mean of communicable and non-communicable DALYs between each country group (*IncomeGroup*, *Invested*, *RenewGen*, *Region*). To tested our hypothesis, we conducted an ANOVA test.
+
+```{r aovTest}
+rbind(
+  round(rbind(
+    as.data.frame(summary(aov(DalyCommPct~IncomeGroup, data = country_tidy))[[1]])[1,],
+    as.data.frame(summary(aov(DalyCommPct~Invested, data = country_tidy))[[1]])[1,],
+    as.data.frame(summary(aov(DalyCommPct~RenewGen, data = country_tidy))[[1]])[1,],
+    as.data.frame(summary(aov(DalyCommPct~Region, data = country_tidy))[[1]])[1,]), 3) |>
+    rownames_to_column(var = "ANOVA") |> mutate(ANOVA = paste("DalyCommPct ~", ANOVA)),
+  round(rbind(
+    as.data.frame(summary(aov(DalyNoncommPct~IncomeGroup, data = country_tidy))[[1]])[1,],
+    as.data.frame(summary(aov(DalyNoncommPct~Invested, data = country_tidy))[[1]])[1,],
+    as.data.frame(summary(aov(DalyNoncommPct~RenewGen, data = country_tidy))[[1]])[1,],
+    as.data.frame(summary(aov(DalyNoncommPct~Region, data = country_tidy))[[1]])[1,]), 3) |>
+    rownames_to_column(var = "ANOVA") |> mutate(ANOVA = paste("DalyNoncommPct ~", ANOVA))) |>
+  mutate(`Pr(>F)` = ifelse(`Pr(>F)` == 0, "<0.001", `Pr(>F)`)) |>
+  kable(
+    digits = 3, align = "lccccc",  format.args = list(big.mark = ","), 
+    format = "latex", booktabs = TRUE, nsmall = 3, scientific = T, linesep = "") |>
+  column_spec(1, border_right = T) |> kable_styling(full_width = F)
+```
+
+We can see that different categorical group has significantly different mean. Hence, it is worth to put them in the model as predictors and interaction terms
+
+## 3.4 Preliminary DALYs NoncommPct vs. Mental Illness
+
+We will conduct a Preliminary visualization between 4 out of 8 mental illness (*Schizophrenia, Bipolar, Eating, Anxiety*). We expect that each mental illness could potentially contribute differently to DALYs Non-communicable diseases.
+
+```{r DalyNoncommPctVsMental, fig.height=5, cache=TRUE}
+mentalProblems <- c("Schizophrenia", "Bipolar", "Eating", "Anxiety")
+
+for (mentalProb in mentalProblems) {
+  print(
+    ggplot(country_tidy, 
+           aes(x = .data[[mentalProb]], 
+               y = DalyNoncommPct, color = IncomeGroup)) +
+      geom_point() +
+      geom_smooth(formula = y ~ x, method = "lm", se = F, linewidth = 1.5) +
+      scale_x_log10() + 
+      theme(legend.position = "top") + 
+      labs(x = var_lab(country_tidy[[mentalProb]]), 
+           y = var_lab(country_tidy[["DalyNoncommPct"]]),
+           title = 
+             paste("DALYs Non-Communicable vs.", mentalProb),
+           subtitle = "With Income Level Control",
+           color = var_lab(country_tidy[["IncomeGroup"]])))
+}
+```
+
+We can see that *Schizophrenia, Anxiety* has different slopes between groups while *Bipolar, Eating Disorder* has similar slopes between groups. We might consider to put some interaction terms in the final model to test verify our hypothesis.
+
+## 3.5 Preliminary DALYs CommPct vs. Energy Resource
+
+We will conduct a Preliminary visualization between 4 energy variable (*ElecFossilFuels, ReElecGen, Co2, LowCarbon*).
+
+```{r DalyCommPctVsEnergy, fig.height = 5, cache=TRUE}
+energyResources <- c("ElecFossilFuels", "ReElecGen", "Co2", "LowCarbon")
+
+for (energyRsc in energyResources) {
+  tmp_vis <- ggplot(country_tidy, 
+                    aes(x = .data[[energyRsc]], y = DalyCommPct, color = IncomeGroup)) +
+    geom_point() +
+    geom_smooth(formula = y ~ x, method = "lm", se = F, linewidth = 1.5) +
+    theme(legend.position = "top") +
+    labs(x = var_lab(country_tidy[[energyRsc]]), y = var_lab(country_tidy[["DalyCommPct"]]),
+         title = paste("DALYs Communicable vs.", energyRsc), subtitle = "With Income Level Control",
+         color = var_lab(country_tidy[["IncomeGroup"]]))
+  if (energyRsc != "LowCarbon") { tmp_vis <- tmp_vis + scale_x_log10()}
+  print(tmp_vis)
+}
+```
+In contrast with how *mental illness* vs. *DALYs NoncommPct*, all energy resoures variables seems to have the same slopes with different intercepts. Hence, there might be no interaction between energy resources and *Income Group* of a country.
+
+## 3.6 Prelimary DALYs vs. Socio-economic variables
+
+```{r DalyVsSocio, fig.height=10, fig.width=7, cache=TRUE}
+socioVars <- c("HealthExp", "EducExp", "Unemployment", "LifeExpectancy")
+for (socioAtt in socioVars) {
+print(
+  (ggplot(country_tidy, aes(x = .data[[socioAtt]], y = DalyNoncommPct, color = IncomeGroup)) +
+    geom_point() + theme(legend.position = "top") + 
+    geom_smooth(formula = y ~ x, method = "lm", se = F, linewidth = 1.5) +
+    scale_y_continuous(limits = c(0, 100)) + scale_x_log10() + 
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank()) +
+    labs(x = "", y = var_lab(country_tidy[["DalyNoncommPct"]]),
+         title = paste("DALYs vs.", socioAtt))) /
+  (ggplot(country_tidy, aes(x = .data[[socioAtt]], y = DalyCommPct, color = IncomeGroup)) +
+    geom_point(show.legend = F) +
+    geom_smooth(formula = y ~ x, method = "lm", se = F, linewidth = 1.5, show.legend = F) +
+    scale_y_continuous(limits = c(0, 100)) + scale_x_log10() + 
+    labs(x = var_lab(country_tidy[[socioAtt]]), y = var_lab(country_tidy[["DalyCommPct"]]))))}
+```
+
+We want to check the connection between Socio-Economic variables with both DAlYs variables. We can see that there are different trends between income level and socio-economic factor. We will take this into account and put interection between socio economic and income into final model.
+
+# 4. Preliminary Model
+
+## 4.1 Partition Data
+
+```{r sampleData, cache=TRUE}
+set.seed(1304)
+country_split <- initial_split(country_tidy, prop = 4/5)
+country_train <- training(country_split)
+country_test  <- testing(country_split)
+```
+
+## 4.2 DALYs Non Communicable Model
+
+### 4.2.1 Simple Model
+
+We want to conduct some preliminary models to have some sense of what the relationship between the response variables and the variables of interests are. First, we will have 1 model to predict *DalyNonCommPct* from 5 Socio-economic factors (*IncomeGroup*, *LifeExpectancy*, *HealthExp*, *EducExp*, *Undernorish*) and only 4 Mental Illness variables (*Eating, Anxiety, DrugUse, Depressive*. For this, we want to use the Simple Linear Model Regression without any interaction terms
+
+```{r NonCommSimple, result = "asis", cache=TRUE}
+NonCommSimple <-  linear_reg() |>
+  set_engine("lm") |>
+  fit(DalyNoncommPct ~ 
+        IncomeGroup + LifeExpectancy + HealthExp + EducExp + Undernorish + 
+        Eating + Anxiety + DrugUse + Depressive, data = country_train)
+
+NonCommSimple |> 
+  tidy() |> 
+  kable(digits = 3, align = "lcccc", 
+        format.args = list(big.mark = ","), 
+        format = "latex", linesep = "",
+        caption = "Fixed Effect for Non Comm Simple Model")
+```
+
+We can see that there are 2 variables that have no significant at all (*Depressive* and *Anxiety*). All socio-economic variables are significant. Hence, we will conduct another linear regression model with interection term to further examine the relationship between explanatory variables. We will include the interaction terms between *IncomeGroup* and *Region* with all other variables. We will keep *Depressive* and *Anxiety* to verify if they are significant in the complex model
+
+\newpage
+### 4.2.2 Complex Model
+
+The model we will train has the response variable as *DalyNonCommPct* from 6 Socio-economic factors (*Region*, *IncomeGroup*, *LifeExpectancy*, *HealthExp*, *EducExp*, *Undernorish*) and all 7 Mental Illness variables and we will include the interection term between regions and socio-economics and interaction terms between income level and mental illness.
+
+```{r NonCommComplex, cache=TRUE}
+NonCommComplex <-  linear_reg() |>
+  set_engine("lm") |>
+  fit(DalyNoncommPct ~ 
+        Region + IncomeGroup + LifeExpectancy + 
+        HealthExp + EducExp + Undernorish + 
+        Schizophrenia + Bipolar + Eating + Anxiety + 
+        DrugUse + Depressive + AlcoholUse +
+        Region*LifeExpectancy + Region*HealthExp + 
+        Region*EducExp + Region*Undernorish + 
+        IncomeGroup*Schizophrenia + IncomeGroup*Bipolar + 
+        IncomeGroup*Eating + IncomeGroup*Anxiety + 
+        IncomeGroup*DrugUse + IncomeGroup*Depressive +
+        IncomeGroup*AlcoholUse, data = country_train)
+
+```
+
+```{r fixedNonCommComplex, results='asis', cache=TRUE}
+NonCommComplex |> tidy() |> filter(!grepl(":",term)) |>
+  kable(digits = 3, align = "lcccc", 
+        format.args = list(big.mark = ","), 
+        format = "latex", linesep = "",
+        caption = "Fixed Effect for Non Comm Complex Model")
+```
+
+```{r interactNonCommComplex, results='asis', cache=TRUE}
+NonCommComplex |> tidy() |> filter(grepl(":",term)) |>
+  kable(digits = 3, align = "lcccc", 
+        format.args = list(big.mark = ","), 
+        format = "latex", linesep = "",
+        caption = "Interact Effect for Non Comm Complex Model")
+```
+
+From the results, regions have significant effect on socio-economics, except for *Health and Education Expediture of South Asia*. In contrast with what we hypothesize, *IncomeGroup* does not have much of the significant effect. While interaction terms give no significant effect for *Low middle* and *upper middle* class and mental illness countries, *High* income group countries have many significant effects on mental health. Interestingly, *Bipolar* has no interaction effect at all within any level of *Income Group*.
+
+\newpage
+### 4.2.3 Evaluation
+
+```{r evalNonComm, cache=TRUE}
+evalTable <- NonCommComplex |>
+  augment(new_data = (NonCommSimple |> 
+  augment(new_data = country_test) |>
+  rename(simple_pred = .pred,
+         simple_resid = .resid))) |>
+  rename(complex_pred = .pred,
+         complex_resid = .resid) 
+
+evalTable |>
+  select(complex_resid, simple_resid, DalyNoncommPct) |>
+  pivot_longer(!DalyNoncommPct, names_sep = "_", 
+               names_to = c("Model", ".value")) |>
+  ggplot(aes(y = resid, x = DalyNoncommPct, color = Model)) +
+    geom_point() +
+    labs(x = "Actual Daly Due to Non-Communicable Diseases",
+         y = "Residual", title = "Residual Plot") +
+    theme(legend.position = "top")
+```
+
+We can see that the Complex model with interaction terms seems to have a closer residual line to zero. However, consider the number of variable we added in, the complex model is not doing as well as expected.
+\pagebreak
+
+## 4.3 DALYs Communicable Model
+
+### 4.3.1 Simple Model
+
+Secondly, we will have 1 model to predict *DalyCommPct* from 5 Socio-economic factors (*IncomeGroup*, *LifeExpectancy*, *HealthExp*, *EducExp*, *Undernorish*) and 5 Energy Resource variables (*ElecFossilFuels, Co2, ElecAcc, CookFuelAcc, Invested*). For this, we want to use the Simple Linear Model Regression without any interaction terms
+
+```{r CommSimple, result = "asis", cache=TRUE}
+CommSimple <-  linear_reg() |>
+  set_engine("lm") |>
+  fit(DalyCommPct ~ 
+        IncomeGroup + LifeExpectancy + 
+        HealthExp + EducExp + Undernorish + 
+        ElecFossilFuels + Co2 + ElecAcc + 
+        CookFuelAcc + Invested, data = country_train)
+
+CommSimple |> 
+  tidy() |> 
+  kable(digits = 3, align = "lcccc", 
+        format.args = list(big.mark = ","), 
+        format = "latex", linesep = "",
+        caption = "Fixed Effect for Comm Simple Model")
+```
+
+We can see that there are 2 variables that have no significant at all (*EducExp* and *Undernorish*). All other socio-economic variables are significant. Hence, we will conduct another linear regression model with interection term to further examine the relationship between explanatory variables. We will include the interaction terms between *IncomeGroup* and *Region* with all other variables. We will keep *EducExp* and *Undernorish* to verify if they are significant in the complex model
+
+### 4.3.2 Complex Model
+
+The model we will train has the response variable as *DalyCommPct* from 6 Socio-economic factors (*Region*, *IncomeGroup*, *LifeExpectancy*, *HealthExp*, *EducExp*, *Undernorish*) and 5 Energy Resource variables similar to the Simple model and we will include the interaction term between regions and socio-economics and interaction terms between income level and resources.
+
+```{r CommComplex, cache=TRUE}
+CommComplex <-  linear_reg() |>
+  set_engine("lm") |>
+  fit(DalyCommPct ~ 
+        Region + IncomeGroup + LifeExpectancy + HealthExp + EducExp + Undernorish + 
+        ElecFossilFuels + Co2 + ElecAcc + CookFuelAcc + Invested +
+        Region*LifeExpectancy + Region*HealthExp + Region*EducExp + Region*Undernorish + 
+        IncomeGroup*ElecFossilFuels + IncomeGroup*Co2 + IncomeGroup*ElecAcc + 
+        IncomeGroup*CookFuelAcc + IncomeGroup*Invested, data = country_train)
+```
+
+```{r fixedCommComplex, results='asis'}
+CommComplex |> tidy() |> filter(!grepl(":",term)) |>
+  kable(digits = 3, align = "lcccc", format.args = list(big.mark = ","), 
+        format = "latex", linesep = "", 
+        caption = "Fixed Effect for Comm Complex Model")
+```
+
+```{r interactCommComplex, results='asis'}
+CommComplex |>  tidy() |> filter(grepl(":",term)) |>
+  kable(digits = 3, align = "lcccc", format.args = list(big.mark = ","), 
+        format = "latex", linesep = "", 
+        caption = "Interection Effect for Comm Complex Model")
+```
+
+From the results, regions have significant effect on socio-economics, except for *LifeExpectancy* as well as *ElecAcc*. In contrast with what we hypothesize, *IncomeGroup* does not have much of the significant effect on *CookFuelAcc* and *Invested*. 
+
+From the results, regions have significant effect on socio-economics, some regions are actually not have significant effect compared to the based regions. In contrast with what we hypothesize, *IncomeGroup* does not have much of the significant effect with *CookFuelAcc* and *Invested*.
+
+\newpage
+### 4.3.3 Evaluation
+
+```{r evalComm, cache=TRUE}
+evalTable <- CommComplex |>
+  augment(new_data = (CommSimple |> 
+  augment(new_data = country_test) |>
+  rename(simple_pred = .pred,
+         simple_resid = .resid))) |>
+  rename(complex_pred = .pred,
+         complex_resid = .resid) 
+
+evalTable |>
+  select(complex_resid, simple_resid, DalyCommPct) |>
+  pivot_longer(!DalyCommPct, names_sep = "_", 
+               names_to = c("Model", ".value")) |>
+  ggplot(aes(y = resid, x = DalyCommPct, color = Model)) +
+    geom_point() +
+    labs(x = "Actual Daly Due to Communicable Diseases",
+         y = "Residual", title = "Residual Plot") +
+    theme(legend.position = "top")
+```
+
+Similar to the model with *DalyNoncommPct*, we can see that the Complex model with interaction terms seems to have a closer residual line to zero. However, consider the number of variable we added in, the complex model is not doing as well as expected.
+
+# 5. Future Work
+
+We want to address our future work here. 
+\begin{enumerate}
+  \item Model Development
+  \begin{enumerate}
+    \item We are going to modify the model to a LASSO model to investiage the strength of each explanatory variable
+    \item We want to explore other model GLM model such as a Beta-Regression model to deal with response variable as percentage from 0 to 1
+    \item We want to explore supervised machine learning model such as Decision Tree to explore relationship between socio-economic variables vs. mental health as well as energy variables.
+  \end{enumerate}
+  \item Data Wrangling
+  \begin{enumerate}
+    \item We might consider recoding some categorical variable to have less level
+    \item We are consider other response variable such as DALYs due to either communicable or non-communicable
+  \end{enumerate}
+  \item Remain Question
+  \begin{enumerate}
+    \item Can we find the detailed relationship between socio-economic variabls and mental/energy variables using DALYs?
+    \item What model should be the best stratergy to go from here?
+    \item We haven't look at the data from the time series angle, would that create other strategies in the final model?
+  \end{enumerate}
+\end{enumerate}
+
+```{bash saveFile, echo = FALSE, result = FALSE}
+
+fileSource=Outline.Rmd
+fileBackup=Outline_backup.Rmd
+
+cp $fileSource $fileBackup
+```
