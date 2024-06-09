@@ -1,5 +1,5 @@
 ---
-title: "Final Analysis"
+title: "Socio-economic and mental healths effects on disability-adjusted life year (DALYs)"
 author: "Nam Nguyen & Hailey Nguyen"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
